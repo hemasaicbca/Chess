@@ -1,0 +1,225 @@
+import { WebSocket } from 'ws';
+import {
+  GAME_ALERT,
+  GAME_ADDED,
+  GAME_ENDED,
+  GAME_JOINED,
+  GAME_NOT_FOUND,
+  EXIT_GAME,
+  INIT_GAME,
+  JOIN_ROOM,
+  MOVE,
+} from './messages';
+import { Game } from './Game';
+import { db } from '@repo/db';
+import { socketManager, User } from './SocketManager';
+
+type MongoGameRecord = {
+  _id: string;
+  whitePlayer: string;
+  blackPlayer: string;
+  status: string;
+  result?: string | null;
+  moves?: Array<{
+    id?: string;
+    gameId?: string;
+    moveNumber: number;
+    from: string;
+    to: string;
+    comments?: string | null;
+    before: string;
+    after: string;
+    timeTaken?: number | null;
+    createdAt?: Date;
+    san?: string | null;
+  }>;
+  startAt: Date;
+};
+
+export class GameManager {
+  private games: Game[];
+  private pendingGameId: string | null;
+  private users: User[];
+
+  constructor() {
+    this.games = [];
+    this.pendingGameId = null;
+    this.users = [];
+  }
+
+  addUser(user: User) {
+    this.users.push(user);
+    this.addHandler(user);
+  }
+
+  removeUser(socket: WebSocket) {
+    const user = this.users.find((user) => user.socket === socket);
+    if (!user) {
+      console.error('User not found?');
+      return;
+    }
+    this.users = this.users.filter((user) => user.socket !== socket);
+    socketManager.removeUser(user);
+  }
+
+  removeGame(gameId: string) {
+    this.games = this.games.filter((g) => g.gameId !== gameId);
+  }
+
+  private addHandler(user: User) {
+    user.socket.on('message', async (data) => {
+      const message = JSON.parse(data.toString());
+
+      if (message.type === INIT_GAME) {
+        if (this.pendingGameId) {
+          const game = this.games.find((x) => x.gameId === this.pendingGameId);
+          if (!game) {
+            console.error('Pending game not found?');
+            return;
+          }
+          if (user.userId === game.player1UserId) {
+            socketManager.broadcast(
+              game.gameId,
+              JSON.stringify({
+                type: GAME_ALERT,
+                payload: {
+                  message: 'Trying to Connect with yourself?',
+                },
+              }),
+            );
+            return;
+          }
+          socketManager.addUser(user, game.gameId);
+          await game.updateSecondPlayer(user.userId);
+          this.pendingGameId = null;
+        } else {
+          const game = new Game(user.userId, null);
+          this.games.push(game);
+          this.pendingGameId = game.gameId;
+          socketManager.addUser(user, game.gameId);
+          socketManager.broadcast(
+            game.gameId,
+            JSON.stringify({
+              type: GAME_ADDED,
+              gameId: game.gameId,
+            }),
+          );
+        }
+      }
+
+      if (message.type === MOVE) {
+        const gameId = message.payload.gameId;
+        const game = this.games.find((game) => game.gameId === gameId);
+        if (game) {
+          game.makeMove(user, message.payload.move);
+          if (game.result) {
+            this.removeGame(game.gameId);
+          }
+        }
+      }
+
+      if (message.type === EXIT_GAME) {
+        const gameId = message.payload.gameId;
+        const game = this.games.find((game) => game.gameId === gameId);
+
+        if (game) {
+          game.exitGame(user);
+          this.removeGame(game.gameId);
+        }
+      }
+
+      if (message.type === JOIN_ROOM) {
+        const gameId = message.payload?.gameId;
+        if (!gameId) {
+          return;
+        }
+
+        let availableGame = this.games.find((game) => game.gameId === gameId);
+        const gameFromDb = (await db.game
+          .findOne({ _id: gameId })
+          .lean()) as MongoGameRecord | null;
+
+        if (availableGame && !availableGame.player2UserId) {
+          socketManager.addUser(user, availableGame.gameId);
+          await availableGame.updateSecondPlayer(user.userId);
+          return;
+        }
+
+        if (!gameFromDb) {
+          user.socket.send(
+            JSON.stringify({
+              type: GAME_NOT_FOUND,
+            }),
+          );
+          return;
+        }
+
+        if (gameFromDb.status !== 'IN_PROGRESS') {
+          const [whitePlayer, blackPlayer] = await Promise.all([
+            db.user.findById(gameFromDb.whitePlayer).lean() as Promise<{ name?: string | null } | null>,
+            db.user.findById(gameFromDb.blackPlayer).lean() as Promise<{ name?: string | null } | null>,
+          ]);
+
+          user.socket.send(
+            JSON.stringify({
+              type: GAME_ENDED,
+              payload: {
+                result: gameFromDb.result,
+                status: gameFromDb.status,
+                moves: gameFromDb.moves,
+                blackPlayer: {
+                  id: gameFromDb.blackPlayer,
+                  name: blackPlayer?.name,
+                },
+                whitePlayer: {
+                  id: gameFromDb.whitePlayer,
+                  name: whitePlayer?.name,
+                },
+              },
+            }),
+          );
+          return;
+        }
+
+        if (!availableGame) {
+          const game = new Game(
+            gameFromDb.whitePlayer,
+            gameFromDb.blackPlayer,
+            gameFromDb._id,
+            gameFromDb.startAt,
+          );
+          game.seedMoves(gameFromDb.moves || []);
+          this.games.push(game);
+          availableGame = game;
+        }
+
+        const [whitePlayer, blackPlayer] = await Promise.all([
+          db.user.findById(gameFromDb.whitePlayer).lean() as Promise<{ name?: string | null } | null>,
+          db.user.findById(gameFromDb.blackPlayer).lean() as Promise<{ name?: string | null } | null>,
+        ]);
+
+        user.socket.send(
+          JSON.stringify({
+            type: GAME_JOINED,
+            payload: {
+              gameId,
+              moves: gameFromDb.moves,
+              blackPlayer: {
+                id: gameFromDb.blackPlayer,
+                name: blackPlayer?.name,
+              },
+              whitePlayer: {
+                id: gameFromDb.whitePlayer,
+                name: whitePlayer?.name,
+              },
+              player1TimeConsumed: availableGame.getPlayer1TimeConsumed(),
+              player2TimeConsumed: availableGame.getPlayer2TimeConsumed(),
+            },
+          }),
+        );
+
+        socketManager.addUser(user, gameId);
+      }
+    });
+  }
+}
